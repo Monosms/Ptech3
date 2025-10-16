@@ -261,9 +261,14 @@ def visualize_and_save_outputs(out_dir: str, bgr: np.ndarray, hair_mask: Optiona
     mask_u8 = (hair_mask > 0).astype(np.uint8) * 255
     cv2.imwrite(str(base / "hair_mask.png"), mask_u8)
 
-    # Cutout
+    # Cutout (BGR)
     cutout = cv2.bitwise_and(bgr, bgr, mask=mask_u8)
     cv2.imwrite(str(base / "hair_cutout.png"), cutout)
+
+    # RGBA cutout (transparent background)
+    b, g, r = cv2.split(bgr)
+    rgba = cv2.merge((b, g, r, mask_u8))
+    cv2.imwrite(str(base / "hair_cutout_rgba.png"), rgba)
 
     # Overlay boundary
     contours, _ = cv2.findContours((mask_u8 > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -275,6 +280,119 @@ def visualize_and_save_outputs(out_dir: str, bgr: np.ndarray, hair_mask: Optiona
 
     with open(base / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
+
+
+def extract_hairline_polyline(hair_mask: np.ndarray, top_roi: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
+    """Estimate hairline as the lowest hair boundary within the top ROI.
+
+    Returns an Nx2 int array of (x, y) points or None if not found.
+    """
+    x, y, w, h = top_roi
+    if w <= 2 or h <= 2:
+        return None
+
+    roi = (hair_mask[y : y + h, x : x + w] > 0)
+    hR, wR = roi.shape[:2]
+    xs: list[int] = []
+    ys: list[float] = []
+
+    for col in range(wR):
+        col_data = roi[:, col]
+        idxs = np.flatnonzero(col_data[::-1])
+        if idxs.size == 0:
+            ys.append(np.nan)
+            xs.append(col)
+        else:
+            y_rel_from_bottom = int(idxs[0])
+            y_rel = (hR - 1) - y_rel_from_bottom
+            ys.append(float(y_rel))
+            xs.append(col)
+
+    xs_arr = np.asarray(xs)
+    ys_arr = np.asarray(ys, dtype=float)
+    valid = ~np.isnan(ys_arr)
+
+    # Find contiguous valid segments and pick the main central one
+    segments: list[Tuple[int, int]] = []
+    start: Optional[int] = None
+    for i, v in enumerate(valid):
+        if v and start is None:
+            start = i
+        elif (not v) and (start is not None):
+            segments.append((start, i - 1))
+            start = None
+    if start is not None:
+        segments.append((start, wR - 1))
+
+    if not segments:
+        return None
+
+    mid = wR // 2
+    def seg_key(seg: Tuple[int, int]) -> Tuple[int, int, int]:
+        s, e = seg
+        crosses_mid = 1 if (s <= mid <= e) else 0
+        length = e - s + 1
+        center_dist = -abs(((s + e) // 2) - mid)
+        return (crosses_mid, length, center_dist)
+
+    s, e = max(segments, key=seg_key)
+    xs_seg = xs_arr[s : e + 1]
+    ys_seg = ys_arr[s : e + 1]
+
+    # Simple moving-average smoothing with edge padding
+    k =  nine_if_possible = min(11, max(3, (len(xs_seg) // 10) * 2 + 1))
+    k = max(3, nine_if_possible if nine_if_possible % 2 == 1 else nine_if_possible - 1)
+    if len(xs_seg) >= k:
+        pad = k // 2
+        ys_pad = np.pad(ys_seg, (pad, pad), mode="edge")
+        kernel = np.ones(k, dtype=float) / float(k)
+        ys_smooth = np.convolve(ys_pad, kernel, mode="valid")
+    else:
+        ys_smooth = ys_seg
+
+    pts = np.column_stack([xs_seg + x, ys_smooth + y]).astype(np.int32)
+    if pts.shape[0] < 2:
+        return None
+    return pts
+
+
+def save_hairline_outputs(base_dir: str, bgr: np.ndarray, hair_mask: np.ndarray, top_roi: Tuple[int, int, int, int], hairline_pts: Optional[np.ndarray]) -> None:
+    base = Path(base_dir)
+    if hairline_pts is None:
+        return
+
+    # Save polyline points
+    pts_list = [{"x": int(p[0]), "y": int(p[1])} for p in hairline_pts.tolist()]
+    with open(base / "hairline_points.json", "w", encoding="utf-8") as f:
+        json.dump({"top_roi": {"x": top_roi[0], "y": top_roi[1], "w": top_roi[2], "h": top_roi[3]}, "points": pts_list}, f, ensure_ascii=False, indent=2)
+
+    # Mask (thin line) and band (thicker for visualization)
+    h, w = hair_mask.shape[:2]
+    thin = np.zeros((h, w), dtype=np.uint8)
+    band = np.zeros((h, w), dtype=np.uint8)
+    cv2.polylines(thin, [hairline_pts], isClosed=False, color=255, thickness=2, lineType=cv2.LINE_AA)
+    cv2.polylines(band, [hairline_pts], isClosed=False, color=255, thickness=6, lineType=cv2.LINE_AA)
+
+    # Keep band inside hair to avoid skin bleed
+    band = cv2.bitwise_and(band, (hair_mask > 0).astype(np.uint8) * 255)
+
+    cv2.imwrite(str(base / "hairline_mask.png"), thin)
+    cv2.imwrite(str(base / "hairline_band.png"), band)
+
+    # RGBA band cutout (transparent background outside band)
+    b_ch, g_ch, r_ch = cv2.split(bgr)
+    band_rgba = cv2.merge((b_ch, g_ch, r_ch, band))
+    cv2.imwrite(str(base / "hairline_band_rgba.png"), band_rgba)
+
+    # Cutout of hairline band
+    hairline_cutout = cv2.bitwise_and(bgr, bgr, mask=band)
+    cv2.imwrite(str(base / "hairline_cutout.png"), hairline_cutout)
+
+    # Overlay line in red on original image
+    overlay = bgr.copy()
+    cv2.polylines(overlay, [hairline_pts], isClosed=False, color=(0, 0, 255), thickness=2, lineType=cv2.LINE_AA)
+    blended = cv2.addWeighted(overlay, 0.5, bgr, 0.5, 0)
+    cv2.imwrite(str(base / "hairline_overlay.png"), blended)
 
 
 def run(image_path: str, output_dir: str, sam_checkpoint: str, variant: str = "vit_b", device: Optional[str] = None, force_download: bool = False) -> None:
@@ -303,9 +421,19 @@ def run(image_path: str, output_dir: str, sam_checkpoint: str, variant: str = "v
 
     hair_mask = select_hair_mask(masks, rgb, top_roi, face_rect)
 
+    # Hairline extraction within the top-of-head ROI
+    hairline_pts = None
+    if hair_mask is not None:
+        try:
+            hairline_pts = extract_hairline_polyline(hair_mask.astype(np.uint8), top_roi)
+        except Exception:
+            hairline_pts = None
+
     metrics = compute_metrics(hair_mask if hair_mask is not None else np.zeros(rgb.shape[:2], dtype=np.uint8), face_rect, top_roi)
 
     visualize_and_save_outputs(output_dir, bgr, hair_mask, metrics)
+    if hair_mask is not None:
+        save_hairline_outputs(output_dir, bgr, hair_mask.astype(np.uint8), top_roi, hairline_pts)
 
     print("[OK] Outputs saved to:", output_dir)
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
